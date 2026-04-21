@@ -7,18 +7,20 @@ def generate_response_stream(context, question):
         return
 
     prompt = f"""
-    Answer ONLY from the provided context.
-    If the question asks for all records/items/students, return all relevant rows present in the context and do not arbitrarily limit to a few entries.
-    If data is missing in context, say it clearly.
+You are an enterprise document assistant.
+Answer only from the provided context.
+If the answer is not in the context, say that clearly.
+If the user asks for a list, table, all rows, or all matching records, include every relevant item found in the context.
+Keep the answer concise, but preserve important values and names exactly.
 
-    Context:
-    {context}
+Context:
+{context}
 
-    Question:
-    {question}
+Question:
+{question}
 
-    Answer:
-    """
+Answer:
+"""
     try:
         with requests.post(
             "http://localhost:11434/api/generate",

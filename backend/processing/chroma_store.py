@@ -57,3 +57,11 @@ def search_chunks(query_embedding, k=3, filename: Optional[str] = None):
 
 def get_collection_size():
     return collection.count()
+
+
+def get_filename_chunk_count(filename: str) -> int:
+    if not filename:
+        return 0
+
+    results = collection.get(where={"filename": filename}, include=[])
+    return len(results.get("ids", []))

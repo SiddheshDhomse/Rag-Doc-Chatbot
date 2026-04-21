@@ -2,10 +2,10 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Backgroun
 import shutil
 import os
 import re
+import time
 from typing import Optional, Tuple
-from processing.embeddings import model
 from processing.chunking import chunk_text
-from processing.embeddings import embed_chunks
+from processing.embeddings import embed_chunks, embed_query
 from ingestion.pdf_parser import extract_text_from_pdf
 from ingestion.excel_parser import extract_text_from_excel
 import numpy as np
@@ -18,7 +18,13 @@ from sqlalchemy.orm import Session
 # New imports for DB and Chroma
 from db.database import engine, Base, get_db
 from db.models import Document
-from processing.chroma_store import delete_chunks_by_filename, index_chunks, search_chunks, get_collection_size
+from processing.chroma_store import (
+    delete_chunks_by_filename,
+    get_collection_size,
+    get_filename_chunk_count,
+    index_chunks,
+    search_chunks,
+)
 
 app = FastAPI()
 
@@ -47,14 +53,16 @@ def choose_retrieval_k(question: str, total_chunks: int) -> int:
         r"\bcomplete\b",
         r"\bentire\b",
         r"\blist\b",
+        r"\btable\b",
+        r"\brows?\b",
         r"\bshow\b.*\bstudents?\b",
         r"\bstudents?\s+data\b",
     )
     is_broad_query = any(re.search(pattern, question_lower) for pattern in broad_patterns)
 
     if is_broad_query:
-        return min(total_chunks, 20)
-    return min(total_chunks, 8)
+        return max(1, min(total_chunks, 16))
+    return max(1, min(total_chunks, 6))
 
 
 def extract_text_and_chunking(file_path: str, extension: str) -> Tuple[str, int, int]:
@@ -79,6 +87,7 @@ def index_file_task(file_path: str, filename: str):
     db.refresh(db_doc)
     
     try:
+        started_at = time.perf_counter()
         extension = os.path.splitext(file_path)[1].lower()
         text, chunk_size, overlap = extract_text_and_chunking(file_path, extension)
         chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
@@ -96,6 +105,8 @@ def index_file_task(file_path: str, filename: str):
         db_doc.chunks_count = len(chunks)
         db_doc.status = "processed"
         db.commit()
+        elapsed = time.perf_counter() - started_at
+        print(f"Indexed {filename} into {len(chunks)} chunks in {elapsed:.2f}s")
     except Exception as e:
         delete_chunks_by_filename(filename)
         db_doc.chunks_count = 0
@@ -120,8 +131,11 @@ async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = 
         raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF or Excel.")
 
     file_path = os.path.join(UPLOAD_DIR, safe_filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    finally:
+        await file.close()
 
     background_tasks.add_task(index_file_task, file_path, safe_filename)
     return {"filename": safe_filename, "message": "Document upload accepted and is processing in background."}
@@ -151,10 +165,22 @@ def delete_document(filename: str, db: Session = Depends(get_db)):
     if not doc and not file_exists:
         raise HTTPException(status_code=404, detail="Document not found.")
 
+    if doc and doc.status == "processing":
+        raise HTTPException(
+            status_code=409,
+            detail="Document is still processing. Try deleting it again after indexing finishes."
+        )
+
     delete_chunks_by_filename(safe_filename)
 
     if file_exists:
-        os.remove(file_path)
+        try:
+            os.remove(file_path)
+        except PermissionError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Document file is still in use. Please wait a moment and try again."
+            ) from exc
 
     if doc:
         db.delete(doc)
@@ -163,22 +189,33 @@ def delete_document(filename: str, db: Session = Depends(get_db)):
     return {"filename": safe_filename, "message": "Document removed from context."}
 
 @app.post("/query/")
-def query_system(question: str, filename: Optional[str] = None):
+def query_system(question: str, filename: Optional[str] = None, db: Session = Depends(get_db)):
     if not question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    if get_collection_size() == 0:
+    safe_filename = os.path.basename(filename).strip() if filename else None
+    total_chunks = get_filename_chunk_count(safe_filename) if safe_filename else get_collection_size()
+
+    if total_chunks == 0:
         raise HTTPException(
             status_code=400,
-            detail="No indexed document found. Upload a PDF/Excel file first."
+            detail="No indexed document found for that scope. Upload a PDF/Excel file first."
         )
 
-    # Encode gives an ndarray, we need a 1D list for chromadb querying
-    query_embedding = model.encode([question])
-    query_embedding_list = np.array(query_embedding).tolist()[0]
+    if safe_filename:
+        doc = db.query(Document).filter(Document.filename == safe_filename).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Selected document was not found.")
+        if doc.status != "processed":
+            raise HTTPException(status_code=400, detail="Selected document is not ready yet.")
 
-    retrieval_k = choose_retrieval_k(question, get_collection_size())
-    initial_results = search_chunks(query_embedding_list, k=min(retrieval_k * 2, 20), filename=filename)
+    query_embedding_list = np.array(embed_query(question)).tolist()
+    retrieval_k = choose_retrieval_k(question, total_chunks)
+    initial_results = search_chunks(
+        query_embedding_list,
+        k=min(max(retrieval_k * 2, retrieval_k), 24),
+        filename=safe_filename,
+    )
 
     refined_results = rerank_chunks(question, initial_results, top_k=retrieval_k)
     if not refined_results:

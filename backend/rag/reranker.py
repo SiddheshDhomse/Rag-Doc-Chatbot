@@ -6,12 +6,14 @@ reranker_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 def rerank_chunks(query: str, chunks: list, top_k: int = 5) -> list:
     if not chunks:
         return []
+    if len(chunks) == 1:
+        return chunks[:top_k]
         
     # Prepare pairs of (query, chunk)
     pairs = [[query, chunk] for chunk in chunks]
     
     # Predict scores
-    scores = reranker_model.predict(pairs)
+    scores = reranker_model.predict(pairs, batch_size=min(16, len(pairs)), show_progress_bar=False)
     
     # Sort chunks based on their score descending
     scored_chunks = list(zip(scores, chunks))
